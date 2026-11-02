@@ -47,7 +47,12 @@ class PosPaymentMethod(models.Model):
         :param operation: The operation to be performed (payment, poll_status).
         '''
         self.ensure_one()
-        provider = self._get_sumup_payment_provider()
+        if not self.env.user.has_group('point_of_sale.group_pos_user'):
+            raise AccessError(_("Only 'group_pos_user' are allowed to send a SumUp request"))
+
+        # Cashiers have no access to payment.provider (system admins only), so
+        # the SumUp credentials are read with sudo, like Odoo's own pos_stripe.
+        provider = self.sudo()._get_sumup_payment_provider()
         if not provider:
             return False
 
@@ -109,7 +114,7 @@ class PosPaymentMethod(models.Model):
         if not self.env.user.has_group('point_of_sale.group_pos_user'):
             raise AccessError(_("Only 'group_pos_user' are allowed to send a SumUp refund request"))
 
-        provider = self._get_sumup_payment_provider()
+        provider = self.sudo()._get_sumup_payment_provider()
         if not provider:
             return {'error': {'code': 'CONFIG_ERROR', 'message': _("SumUp provider is not configured.")}}
 
