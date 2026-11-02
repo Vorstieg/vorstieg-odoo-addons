@@ -42,9 +42,34 @@ class SumUpReaderPairingWizard(models.TransientModel):
             "name": self.reader_name,
             "meta": {}
         }
-        response = requests.post(url, headers=headers, data=json.dumps(payload), timeout=10)
+        try:
+            response = requests.post(url, headers=headers, data=json.dumps(payload), timeout=10)
+        except requests.exceptions.RequestException as e:
+            raise UserError(_("Could not reach SumUp: %s", e))
+
         if response.status_code != 201:
-            raise UserError(response.json()['message'])
+            # Surface the real SumUp error instead of crashing on a missing
+            # 'message' key (the error body shape varies: message / error_message
+            # / error_description / error, and is sometimes not JSON at all).
+            try:
+                body = response.json()
+            except ValueError:
+                body = {}
+            msg = (
+                body.get('message')
+                or body.get('error_message')
+                or body.get('error_description')
+                or body.get('error')
+                or (response.text or '').strip()
+                or _("Unknown error")
+            )
+            raise UserError(_(
+                "SumUp reader pairing failed (HTTP %(code)s): %(msg)s\n\n"
+                "Check that the Merchant Code and API Key on the SumUp provider are "
+                "correct and enabled, and that the pairing code is still valid "
+                "(they expire quickly — generate a fresh one if needed).",
+                code=response.status_code, msg=msg,
+            ))
 
         data = response.json()
         self.env['sumup.terminal'].create({

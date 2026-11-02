@@ -80,7 +80,23 @@ class PosPaymentMethod(models.Model):
             params = {
                 'client_transaction_id': client_transaction_id
             }
-            return provider.sumup_make_request(endpoint, method='GET', params=params)
+            response = provider.sumup_make_request(endpoint, method='GET', params=params)
+
+            # The reader checkout is asynchronous and SumUp needs some time to
+            # make the transaction queryable through this endpoint. Until then it
+            # replies with a 404. That is NOT a failure: the payment may still be
+            # in progress or may have just succeeded on the terminal. Report it
+            # as a transient PENDING so the front-end keeps polling instead of
+            # treating it as an error (which previously caused the endless
+            # spinner and, on cashier abort, double charges).
+            error = response.get('error') if isinstance(response, dict) else None
+            if error and error.get('http_status') == 404:
+                return {'status': 'PENDING'}
+            # Some SumUp response shapes wrap the result in "items"; normalize to
+            # a single transaction object so the front-end can read 'status'.
+            if isinstance(response, dict) and response.get('items'):
+                return response['items'][0]
+            return response
 
         elif operation == 'cancel':
              endpoint = f"v0.1/merchants/{provider.sumup_merchant_code}/readers/{self.reader.terminal_id}/terminate"

@@ -49,4 +49,39 @@ patch(PaymentScreen.prototype, {
 
         return await super.addNewPaymentLine(paymentMethod);
     },
+
+    async deletePaymentLine(uuid) {
+        const line = this.paymentLines.find((l) => l.uuid === uuid);
+
+        // Before cancelling/removing a SumUp payment that is still in progress,
+        // make sure it did not already succeed on the terminal. If it did, book
+        // it and KEEP the line (the core would otherwise remove it
+        // unconditionally), preventing the double charge. Only then fall back to
+        // the normal cancel (which terminates the reader and removes the line).
+        if (
+            line &&
+            line.payment_method_id?.use_payment_terminal === "sumup" &&
+            line.transaction_id &&
+            ["waiting", "waitingCard", "timeout"].includes(line.getPaymentStatus())
+        ) {
+            const terminal = line.payment_method_id.payment_terminal;
+            const booked = await terminal.bookIfAlreadySuccessful(line);
+            if (booked) {
+                this.numberBuffer.reset();
+                // Finish the order automatically if it is now fully paid, so the
+                // cashier is not left on a "stuck in payment" screen.
+                const order = this.currentOrder;
+                if (
+                    order.isPaid() &&
+                    this.pos.config.auto_validate_terminal_payment &&
+                    !order.isRefundInProcess()
+                ) {
+                    this.validateOrder(false);
+                }
+                return;
+            }
+        }
+
+        return super.deletePaymentLine(uuid);
+    },
 });

@@ -20,11 +20,53 @@ export class PaymentSumup extends PaymentInterface {
 
     sendPaymentCancel(order, uuid) {
         super.sendPaymentCancel(order, uuid);
-        return this._call_sumup({}, 'cancel');
+        // The "did the payment already succeed?" final check happens in the
+        // PaymentScreen.deletePaymentLine override (that is where we can decide
+        // whether the line is kept). By the time we get here the decision to
+        // terminate has been made, so just terminate the reader checkout.
+        return this._call_sumup({}, "cancel");
+    }
+
+    /**
+     * Called from the PaymentScreen before a SumUp line is cancelled/removed.
+     * If the payment already succeeded on the terminal, book it (so the cashier
+     * is not tricked into a second, cash payment -> the double-charge bug) and
+     * return true so the screen keeps the line instead of terminating/removing.
+     */
+    async bookIfAlreadySuccessful(line) {
+        const client_transaction_id = line && line.transaction_id;
+        if (!client_transaction_id) {
+            return false;
+        }
+        const status = await this._call_sumup(
+            { client_transaction_id: client_transaction_id },
+            "poll_status"
+        ).catch(() => null);
+
+        if (status && !status.error && status.status === "SUCCESSFUL") {
+            await this._finalize_successful_payment(line, status);
+            this._show_error(
+                _t(
+                    "This SumUp payment was already completed on the terminal and has been booked. It was NOT cancelled."
+                ),
+                _t("Payment already completed")
+            );
+            return true;
+        }
+        return false;
     }
 
     pending_sumup_line() {
         return this.pos.getPendingPaymentLine("sumup");
+    }
+
+    // Returns the payment line for `uuid` only if it is still part of the
+    // current order (i.e. not removed by a concurrent cancel). Used by the poll
+    // loop so it never resolves a result onto a removed line, which would crash
+    // the core's handlePaymentResponse (reading payment_method_id of undefined).
+    _live_line(uuid) {
+        const order = this.pos.getOrder();
+        return order && order.payment_ids.find((paymentLine) => paymentLine.uuid === uuid);
     }
 
     _handle_odoo_connection_failure(data = {}) {
@@ -149,45 +191,60 @@ export class PaymentSumup extends PaymentInterface {
     }
 
     async _poll_for_status(uuid, client_transaction_id) {
-        var line = this.pending_sumup_line();
-        if (!line || line.uuid !== uuid) {
-            return Promise.resolve(); // Payment cancelled or changed
+        // Stop conditions that must be checked at every step, because the cashier
+        // can cancel (remove the line) or the cancel path can book it (set it
+        // "done") while we are mid-poll:
+        //  - line removed   -> return false (core sets the orphan to retry, no crash)
+        //  - line already done -> return true (keep it done, don't downgrade)
+        let line = this._live_line(uuid);
+        if (!line) {
+            return false;
+        }
+        if (line.payment_status === "done") {
+            return true;
         }
 
         // Poll every 3 seconds
         await new Promise(resolve => setTimeout(resolve, 3000));
 
+        line = this._live_line(uuid);
+        if (!line) {
+            return false;
+        }
+        if (line.payment_status === "done") {
+            return true;
+        }
+
         var data = { 'client_transaction_id': client_transaction_id };
         const response = await this._call_sumup(data, 'poll_status');
 
-        if (response.error) {
-            console.error("SumUp Poll Error", response.error);
+        // Re-check liveness after the network round-trip.
+        line = this._live_line(uuid);
+        if (!line) {
+            return false;
+        }
+        if (line.payment_status === "done") {
+            return true;
+        }
+
+        // A genuine transport error (Odoo unreachable) is already handled by
+        // _call_sumup -> _handle_odoo_connection_failure (it sets the line to
+        // "retry" and rejects), so we never reach this point in that case.
+        if (response && response.error) {
+            // SumUp-side error while the payment may still be live on the
+            // terminal. We must NOT abandon the line here: doing so is exactly
+            // what produced the double charges. Keep polling; the only
+            // deliberate exit is a definitive status or the cashier pressing X
+            // (which runs a final status check before terminating).
+            console.warn("SumUp poll: transient error, keep polling", response.error);
             return this._poll_for_status(uuid, client_transaction_id);
         }
 
-        var status = response.status;
+        const status = response && response.status;
 
         if (status === 'SUCCESSFUL') {
-            line.setPaymentStatus("done");
-            line.transaction_id = response.id || response.transaction_code;
-
-            // Card details for receipt
-            if (response.card) {
-                line.card_type = response.card.type;
-                line.cardholder_name = response.card.last_4_digits;
-            }
-
-            // Handle Tipping: if authorized amount > requested amount
-            if (response.amount && response.amount > line.amount) {
-                const tip_amount = response.amount - line.amount;
-                if (this.pos.config.tip_product_id) {
-                    await this.pos.setTip(tip_amount);
-                }
-                line.setAmount(response.amount);
-            }
-
-            return true;
-        } else if (status === 'FAILED') {
+            return this._finalize_successful_payment(line, response);
+        } else if (status === 'FAILED' || status === 'CANCELLED') {
             this._show_error(_t("Payment failed."));
             line.setPaymentStatus("retry");
             return false;
@@ -195,11 +252,41 @@ export class PaymentSumup extends PaymentInterface {
             this._show_error(_t("Payment expired."));
             line.setPaymentStatus("retry");
             return false;
-        } else if (status === 'PENDING') {
-            return this._poll_for_status(uuid, client_transaction_id);
-        } else {
-            this._show_error(_t("Payment expired."));
         }
+
+        // PENDING, our 404 -> PENDING mapping, or any other intermediate /
+        // unknown status: keep polling until SumUp returns a definitive result.
+        // Never give up on a transaction that might still succeed.
+        return this._poll_for_status(uuid, client_transaction_id);
+    }
+
+    async _finalize_successful_payment(line, response) {
+        // The poll loop and the cancel path can both observe SUCCESSFUL for the
+        // same transaction. Guard against booking it twice (which could e.g.
+        // apply the tip twice). setPaymentStatus("done") below runs before any
+        // await, so a second concurrent call sees "done" and bails out here.
+        if (line.payment_status === "done") {
+            return true;
+        }
+        line.setPaymentStatus("done");
+        line.transaction_id = response.id || response.transaction_code || line.transaction_id;
+
+        // Card details for receipt
+        if (response.card) {
+            line.card_type = response.card.type;
+            line.cardholder_name = response.card.last_4_digits;
+        }
+
+        // Handle Tipping: if authorized amount > requested amount
+        if (response.amount && response.amount > line.amount) {
+            const tip_amount = response.amount - line.amount;
+            if (this.pos.config.tip_product_id) {
+                await this.pos.setTip(tip_amount);
+            }
+            line.setAmount(response.amount);
+        }
+
+        return true;
     }
 
     _show_error(msg, title) {

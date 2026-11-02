@@ -32,11 +32,16 @@ class TestPosSumupRefund(TransactionCase):
             ('company_id', '=', cls.company.id),
             ('type', '=', 'bank'),
         ], limit=1)
+        cls.reader = cls.env['sumup.terminal'].create({
+            'name': 'Test Reader',
+            'terminal_id': 'rdr_test',
+        })
         cls.payment_method = cls.env['pos.payment.method'].create({
             'name': 'SumUp Terminal',
             'journal_id': journal.id,
             'payment_method_type': 'terminal',
             'use_payment_terminal': 'sumup',
+            'reader': cls.reader.id,
         })
 
     def test_sumup_full_refund_request(self):
@@ -86,6 +91,39 @@ class TestPosSumupRefund(TransactionCase):
 
         self.assertEqual(result['error']['code'], 'REFUND_LIMIT_EXCEEDED')
         self.assertEqual(mocked.call_count, 1)
+
+    def test_poll_status_maps_404_to_pending(self):
+        """A 404 while polling means the transaction is not indexed yet and must
+        be reported as PENDING so the front-end keeps polling instead of
+        treating it as a hard error."""
+        with patch.object(type(self.provider), 'sumup_make_request', return_value={
+            'error': {'code': 'API_ERROR', 'message': 'Not Found', 'http_status': 404},
+        }):
+            result = self.payment_method.proxy_sumup_request(
+                {'client_transaction_id': 'ctid-1'}, 'poll_status'
+            )
+
+        self.assertEqual(result, {'status': 'PENDING'})
+
+    def test_poll_status_passes_through_real_errors(self):
+        """Non-404 errors (e.g. auth) must not be hidden behind PENDING."""
+        error = {'error': {'code': 'AUTH_ERROR', 'message': 'nope', 'http_status': 401}}
+        with patch.object(type(self.provider), 'sumup_make_request', return_value=error):
+            result = self.payment_method.proxy_sumup_request(
+                {'client_transaction_id': 'ctid-2'}, 'poll_status'
+            )
+
+        self.assertEqual(result, error)
+
+    def test_poll_status_returns_successful_transaction(self):
+        """A resolved transaction is returned untouched to the front-end."""
+        transaction = {'id': 'txn-9', 'status': 'SUCCESSFUL', 'amount': 42.0}
+        with patch.object(type(self.provider), 'sumup_make_request', return_value=transaction):
+            result = self.payment_method.proxy_sumup_request(
+                {'client_transaction_id': 'ctid-3'}, 'poll_status'
+            )
+
+        self.assertEqual(result, transaction)
 
     def test_sumup_refund_falls_back_to_transaction_code_lookup(self):
         with patch.object(type(self.provider), 'sumup_make_request', side_effect=[

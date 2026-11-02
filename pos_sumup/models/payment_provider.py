@@ -43,20 +43,49 @@ class PaymentProvider(models.Model):
             _logger.error("SumUp Connection Error")
             return {'error': {'code': 'NETWORK_ERROR', 'message': 'Could not connect to SumUp.'}}
         except requests.exceptions.HTTPError as e:
-            _logger.error("SumUp API HTTP Error: %s", e)
-            if response.status_code in (401, 403):
-                 return {'error': {'code': 'AUTH_ERROR', 'message': 'Authentication failed. Check API Key.'}}
-            
-            # Try to get more details from the response body for 400/422
+            status_code = response.status_code
+            # A 404 is expected while polling for a transaction that SumUp has
+            # not indexed yet (the reader checkout is asynchronous). Do not spam
+            # the log with errors for it; callers decide how to treat it via the
+            # 'http_status' key below.
+            body_text = (response.text or '')[:1000]
+            if status_code == 404:
+                _logger.info("SumUp API 404 (resource not found / not yet available): %s", url)
+            else:
+                _logger.error("SumUp API HTTP Error %s for %s | body=%s", status_code, url, body_text)
+
+            if status_code in (401, 403):
+                 return {'error': {'code': 'AUTH_ERROR', 'message': 'Authentication failed. Check API Key.', 'http_status': status_code}}
+
+            # Surface the real SumUp validation detail (the body shape varies:
+            # dict with message/error_message/detail, or a list of field errors).
+            error_code = 'API_ERROR'
+            error_msg = None
             try:
                 error_data = response.json()
-                error_msg = error_data.get('message') or error_data.get('error_description') or str(e)
-                error_code = error_data.get('error_code', 'API_ERROR')
-                return {'error': {'code': error_code, 'message': f"SumUp: {error_msg}"}}
             except ValueError:
-                pass
-                
-            return {'error': {'code': 'API_ERROR', 'message': str(e)}}
+                error_data = None
+            if isinstance(error_data, dict):
+                error_code = error_data.get('error_code', error_code)
+                error_msg = (error_data.get('message') or error_data.get('error_message')
+                             or error_data.get('error_description') or error_data.get('detail'))
+                if not error_msg and error_data.get('errors'):
+                    error_msg = str(error_data['errors'])
+            elif isinstance(error_data, list) and error_data:
+                parts = []
+                for item in error_data:
+                    if isinstance(item, dict):
+                        parts.append('%s: %s' % (
+                            item.get('param', '?'),
+                            item.get('message') or item.get('error_message') or item,
+                        ))
+                    else:
+                        parts.append(str(item))
+                error_msg = '; '.join(parts)
+            if not error_msg:
+                error_msg = body_text or str(e)
+
+            return {'error': {'code': error_code, 'message': f"SumUp: {error_msg}", 'http_status': status_code}}
         except requests.exceptions.RequestException as e:
             _logger.error("SumUp API Error: %s", e)
             return {'error': {'code': 'UNKNOWN_ERROR', 'message': str(e)}}
