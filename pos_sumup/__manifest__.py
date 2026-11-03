@@ -2,7 +2,7 @@
 # Part of Odoo. See LICENSE file for full copyright and licensing details.
 {
     'name': 'POS Sumup',
-    'version': '1.1',
+    'version': '1.2',
     'category': 'Sales/Point of Sale',
     'sequence': 6,
     'summary': 'Integrate your POS with a SumUp payment terminal',

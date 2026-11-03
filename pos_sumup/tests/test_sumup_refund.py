@@ -1,6 +1,7 @@
 from unittest.mock import patch
 
-from odoo.tests.common import TransactionCase
+from odoo.exceptions import AccessError
+from odoo.tests.common import TransactionCase, new_test_user
 
 
 class TestPosSumupRefund(TransactionCase):
@@ -143,3 +144,46 @@ class TestPosSumupRefund(TransactionCase):
             mocked.call_args_list[1].kwargs['params'],
             {'transaction_code': 'legacy-transaction-code'},
         )
+
+    def test_pos_user_can_start_payment(self):
+        """A cashier with only 'Point of Sale / User' has no access to
+        payment.provider but must still be able to send a payment to the reader."""
+        pos_user = new_test_user(self.env, 'sumup_cashier', groups='base.group_user,point_of_sale.group_pos_user')
+        with self.assertRaises(AccessError):
+            self.env['payment.provider'].with_user(pos_user).search([('code', '=', 'sumup')])
+
+        with patch.object(type(self.provider), 'sumup_make_request', return_value={
+            'data': {'client_transaction_id': 'ctid-1'},
+        }) as mocked:
+            result = self.payment_method.with_user(pos_user).proxy_sumup_request({
+                'total_amount': {'value': 1000, 'currency': 'EUR', 'minor_unit': 2},
+            }, 'payment')
+
+        self.assertEqual(result, {'data': {'client_transaction_id': 'ctid-1'}})
+        self.assertEqual(
+            mocked.call_args.args[0],
+            'v0.1/merchants/merchant-code/readers/rdr_test/checkout',
+        )
+
+    def test_pos_user_can_request_refund(self):
+        pos_user = new_test_user(self.env, 'sumup_cashier', groups='base.group_user,point_of_sale.group_pos_user')
+        with patch.object(type(self.provider), 'sumup_make_request', side_effect=[
+            {'id': 'txn-5', 'status': 'SUCCESSFUL', 'amount': 20.0},
+            {},
+        ]):
+            result = self.payment_method.with_user(pos_user).sumup_make_refund_request({
+                'transaction_id': 'txn-5',
+                'amount': 20.0,
+            })
+
+        self.assertEqual(result['success'], True)
+
+    def test_non_pos_user_cannot_send_request(self):
+        user = new_test_user(self.env, 'sumup_employee', groups='base.group_user')
+        with patch.object(type(self.provider), 'sumup_make_request') as mocked:
+            with self.assertRaises(AccessError):
+                self.payment_method.with_user(user).proxy_sumup_request({
+                    'total_amount': {'value': 1000, 'currency': 'EUR', 'minor_unit': 2},
+                }, 'payment')
+
+        mocked.assert_not_called()
